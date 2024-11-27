@@ -44,3 +44,8 @@ exports.axios = require('./axios');
  */
 
 exports.setLogger = require('./logger').setLogger;
+
+/**
+ * Errors
+ */
+exports.HttpError = require('./error/http');

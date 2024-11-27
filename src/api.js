@@ -2,6 +2,7 @@
  * ACME API client
  */
 
+const HttpError = require('./error/http');
 const util = require('./util');
 
 /**
@@ -50,7 +51,7 @@ class AcmeApi {
         const resp = await this.http.signedRequest(url, payload, { kid, includeExternalAccountBinding });
 
         if (validStatusCodes.length && (validStatusCodes.indexOf(resp.status) === -1)) {
-            throw new Error(util.formatResponseError(resp));
+            throw new HttpError(util.formatResponseError(resp), resp);
         }
 
         return resp;

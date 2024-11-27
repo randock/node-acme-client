@@ -2,7 +2,7 @@
  * acme-client type definitions
  */
 
-import { AxiosInstance } from 'axios';
+import { AxiosInstance, AxiosResponse } from 'axios';
 import * as rfc8555 from './rfc8555';
 
 export type PrivateKeyBuffer = Buffer;
@@ -188,3 +188,11 @@ export const axios: AxiosInstance;
  */
 
 export function setLogger(fn: (msg: string) => void): void;
+
+/**
+ * Errors
+ */
+export class HttpError extends Error {
+    constructor(message?: string, response?: AxiosResponse);
+    response?: AxiosResponse;
+}
