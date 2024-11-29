@@ -44,12 +44,14 @@ export interface Order {
     notAfter?: string;
     error?: object;
     certificate?: string;
+    replaces?: string;
 }
 
 export interface OrderCreateRequest {
     identifiers: Identifier[];
     notBefore?: string;
     notAfter?: string;
+    replaces?: string;
 }
 
 /**
@@ -77,6 +79,7 @@ export interface Identifier {
  * https://datatracker.ietf.org/doc/html/rfc8555#section-8
  * https://datatracker.ietf.org/doc/html/rfc8555#section-8.3
  * https://datatracker.ietf.org/doc/html/rfc8555#section-8.4
+ * https://datatracker.ietf.org/doc/html/rfc8737#section-3
  */
 
 export interface ChallengeAbstract {
@@ -87,17 +90,22 @@ export interface ChallengeAbstract {
     error?: object;
 }
 
-export interface HttpChallenge extends ChallengeAbstract {
+export interface Http01Challenge extends ChallengeAbstract {
     type: 'http-01';
     token: string;
 }
 
-export interface DnsChallenge extends ChallengeAbstract {
+export interface Dns01Challenge extends ChallengeAbstract {
     type: 'dns-01';
     token: string;
 }
 
-export type Challenge = HttpChallenge | DnsChallenge;
+export interface TlsAlpn01Challenge extends ChallengeAbstract {
+    type: 'tls-alpn-01';
+    token: string;
+}
+
+export type Challenge = Http01Challenge | Dns01Challenge | TlsAlpn01Challenge;
 
 /**
  * Certificate
@@ -120,4 +128,20 @@ export enum CertificateRevocationReason {
 
 export interface CertificateRevocationRequest {
     reason?: CertificateRevocationReason;
+}
+
+/**
+ * Certificate ACME Renewal Information (ARI)
+ *
+ * https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari
+ */
+
+export interface CertificateRenewalWindow {
+    start: string;
+    end: string;
+}
+
+export interface CertificateRenewalInfo {
+    suggestedWindow: CertificateRenewalWindow;
+    explanationURL?: string;
 }

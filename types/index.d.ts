@@ -27,6 +27,10 @@ export interface Authorization extends rfc8555.Authorization {
     url: string;
 }
 
+export interface CertificateRenewalInfo extends rfc8555.CertificateRenewalInfo {
+    retryAfter: number;
+}
+
 /**
  * Client
  */
@@ -75,6 +79,8 @@ export class Client {
     waitForValidStatus<T = Order | Authorization | rfc8555.Challenge>(item: T): Promise<T>;
     getCertificate(order: Order, preferredChain?: string): Promise<string>;
     revokeCertificate(cert: CertificateBuffer | CertificateString, data?: rfc8555.CertificateRevocationRequest): Promise<void>;
+    getCertificateRenewalInfo(certId: string): Promise<CertificateRenewalInfo>;
+    getSecondsUntilCertificateRenewable(certId: string): Promise<number>;
     auto(opts: ClientAutoOptions): Promise<string>;
 }
 
@@ -158,11 +164,12 @@ export interface CryptoInterface {
     createCsr(data: CsrOptions, keyPem?: PrivateKeyBuffer | PrivateKeyString): Promise<[PrivateKeyBuffer, CsrBuffer]>;
     createAlpnCertificate(authz: Authorization, keyAuthorization: string, keyPem?: PrivateKeyBuffer | PrivateKeyString): Promise<[PrivateKeyBuffer, CertificateBuffer]>;
     isAlpnCertificateAuthorizationValid(certPem: CertificateBuffer | CertificateString, keyAuthorization: string): boolean;
+    getAriCertificateId(certPem: CertificateBuffer | CertificateString): string;
 }
 
 export const crypto: CryptoInterface;
 
-/* TODO: LEGACY */
+// TODO: LEGACY
 export interface CryptoLegacyInterface {
     createPrivateKey(size?: number): Promise<PrivateKeyBuffer>;
     createPublicKey(key: PrivateKeyBuffer | PrivateKeyString): Promise<PublicKeyBuffer>;
