@@ -59,6 +59,7 @@ export interface ClientAutoOptions {
     skipChallengeVerification?: boolean;
     challengePriority?: string[];
     preferredChain?: string;
+    replacesCertificateId?: string;
 }
 
 export class Client {
