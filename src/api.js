@@ -244,7 +244,7 @@ class AcmeApi {
         const resp = await this.http.request(`${url}/${certId}`, 'GET');
 
         if (resp.status !== 200) {
-            throw new Error(util.formatResponseError(resp));
+            throw new HttpError(util.formatResponseError(resp), resp);
         }
 
         return resp;

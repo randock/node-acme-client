@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased (randock fork)
+
+* `fixed` Retried ACME requests are signed again with a fresh nonce instead of resending a spent one, so a `429` on a signed request no longer surfaces as `badNonce`
+* `fixed` A failed nonce fetch while retrying hands back the original `429`/`5xx` response instead of a generic "Failed to get nonce" error
+* `fixed` ARI renewal info errors are thrown as `HttpError` with the response, like other ACME API errors
+* `changed` All request retries happen in the ACME HTTP client (`src/retry.js`); the exported `acme.axios` instance no longer retries anything by itself
+    * Requests made directly through `acme.axios` (outside the client) are no longer retried on `429`, `5xx` or transport errors
+    * A missing or non-numeric `acmeSettings.retryMaxAttempts` now means no retries
+
 ## v5.4.0 (2024-07-16)
 
 * `added` Directory URLs for [Google](https://cloud.google.com/certificate-manager/docs/overview) ACME provider

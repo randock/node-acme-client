@@ -257,6 +257,8 @@ const order = await client.createOrder({
 
 This module uses [axios](https://github.com/axios/axios) when communicating with the ACME HTTP API, and exposes the client instance through `.axios`.
 
+Retries are handled by the ACME client itself, not by this axios instance: rate limits (`429`), server errors (`5xx`) and transport errors are retried according to `acme.axios.defaults.acmeSettings` (`retryMaxAttempts`, `retryDefaultDelay`, `retryMaxDelay`), and signed requests are signed again with a fresh nonce on every retry. Requests you send yourself through `acme.axios` are not retried.
+
 For example, should you need to change the default axios configuration to route requests through an HTTP proxy, this can be achieved as follows:
 
 ```js

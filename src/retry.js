@@ -22,6 +22,35 @@ const { log } = require('./logger');
 const NON_RETRYABLE_CODES = ['ECONNABORTED', 'ERR_NOCK_NO_MATCH'];
 
 /**
+ * Longest wait setTimeout can schedule; anything above fires immediately
+ */
+
+const MAX_TIMER_SECONDS = Math.floor(2147483647 / 1000);
+
+/**
+ * Retry settings, read defensively
+ *
+ * A consumer may replace `acmeSettings` wholesale and leave fields out. A
+ * missing or non-numeric `retryMaxAttempts` means no retries at all (as the old
+ * interceptor behaved), so a bad configuration can never loop; a missing
+ * `retryDefaultDelay` falls back to 5 seconds and a missing `retryMaxDelay` to
+ * no cap.
+ *
+ * @returns {{retryMaxAttempts: number, retryDefaultDelay: number, retryMaxDelay: (number|null)}}
+ */
+
+function getRetrySettings() {
+    const settings = axios.defaults.acmeSettings || {};
+    const finite = (value, fallback) => (Number.isFinite(value) && (value >= 0) ? value : fallback);
+
+    return {
+        retryMaxAttempts: finite(settings.retryMaxAttempts, 0),
+        retryDefaultDelay: finite(settings.retryDefaultDelay, 5),
+        retryMaxDelay: finite(settings.retryMaxDelay, null),
+    };
+}
+
+/**
  * Seconds to wait before trying a request again, or null to give up
  *
  * Rate limits (429), server errors (5xx) and transport failures are retried,
@@ -38,7 +67,7 @@ const NON_RETRYABLE_CODES = ['ECONNABORTED', 'ERR_NOCK_NO_MATCH'];
  */
 
 function getRetryDelay({ response = null, error = null }, attempt) {
-    const { retryMaxAttempts, retryDefaultDelay, retryMaxDelay } = axios.defaults.acmeSettings;
+    const { retryMaxAttempts, retryDefaultDelay, retryMaxDelay } = getRetrySettings();
 
     if (attempt >= retryMaxAttempts) {
         return null;
@@ -61,8 +90,10 @@ function getRetryDelay({ response = null, error = null }, attempt) {
     const retryAfter = parseRetryAfterHeader(response.headers['retry-after']);
 
     if (retryAfter > 0) {
-        if ((retryMaxDelay !== null) && (retryAfter > retryMaxDelay)) {
-            log(`Retry-after of ${retryAfter} seconds exceeds retryMaxDelay of ${retryMaxDelay}, not retrying`);
+        const cap = (retryMaxDelay !== null) ? Math.min(retryMaxDelay, MAX_TIMER_SECONDS) : MAX_TIMER_SECONDS;
+
+        if (retryAfter > cap) {
+            log(`Retry-after of ${retryAfter} seconds exceeds the maximum delay of ${cap}, not retrying`);
             return null;
         }
 
@@ -84,7 +115,7 @@ function getRetryDelay({ response = null, error = null }, attempt) {
 
 function waitForRetry({ response = null, error = null }, delay, attempt, url) {
     const cause = response ? `HTTP ${response.status}` : (error && error.code) || 'transport error';
-    log(`Caught ${cause}, retry attempt ${attempt}/${axios.defaults.acmeSettings.retryMaxAttempts} to URL ${url}, waiting ${delay} seconds`);
+    log(`Caught ${cause}, retry attempt ${attempt}/${getRetrySettings().retryMaxAttempts} to URL ${url}, waiting ${delay} seconds`);
 
     return new Promise((resolve) => { setTimeout(resolve, (delay * 1000)); });
 }
@@ -127,6 +158,7 @@ async function retryIdempotent(send, url, attempt = 0) {
 }
 
 module.exports = {
+    getRetrySettings,
     getRetryDelay,
     waitForRetry,
     retryIdempotent,

@@ -42,9 +42,10 @@ class Backoff {
 /**
  * Determine if an error has already been retried by the HTTP layer
  *
- * Mirrors isRetryableError() in axios.js. Those attempts honor the Retry-After the
- * provider sent, so repeating them here on a blind backoff only spends more of a quota
- * that is already exhausted, and multiplies out the attempts the caller asked for.
+ * Matches the statuses getRetryDelay() in retry.js retries (429 and 5xx), which
+ * HttpClient has already retried while honouring the Retry-After the provider sent.
+ * Repeating them here on a blind backoff only spends more of a quota that is already
+ * exhausted, and multiplies out the attempts the caller asked for.
  *
  * @param {Error} e Error
  * @returns {boolean} Error has already been retried
