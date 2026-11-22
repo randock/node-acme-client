@@ -58,6 +58,23 @@ describe('retry', () => {
             assert.isNull(getRetryDelay({ response: response(503) }, 3));
         });
 
+        it('should cap the default backoff at retryMaxDelay', () => {
+            axios.defaults.acmeSettings.retryDefaultDelay = 1000;
+            axios.defaults.acmeSettings.retryMaxDelay = 60;
+            assert.strictEqual(getRetryDelay({ response: response(503) }, 2), 60);
+        });
+
+        it('should hand back a Retry-After too large to parse', () => {
+            assert.isNull(getRetryDelay({ response: response(429, { 'retry-after': '99999999999999999999' }) }, 0));
+        });
+
+        it('should read numeric strings in the settings', () => {
+            axios.defaults.acmeSettings = { retryMaxAttempts: '2', retryDefaultDelay: '7', retryMaxDelay: '120' };
+            assert.strictEqual(getRetryDelay({ response: response(503) }, 0), 7);
+            assert.isNull(getRetryDelay({ response: response(503) }, 2));
+            assert.isNull(getRetryDelay({ response: response(429, { 'retry-after': '121' }) }, 0));
+        });
+
         it('should retry transport failures, except aborted requests', () => {
             assert.strictEqual(getRetryDelay({ error: { code: 'ECONNRESET' } }, 0), 0);
             assert.isNull(getRetryDelay({ error: { code: 'ECONNABORTED' } }, 0));

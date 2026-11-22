@@ -7,7 +7,10 @@
 * `fixed` ARI renewal info errors are thrown as `HttpError` with the response, like other ACME API errors
 * `changed` All request retries happen in the ACME HTTP client (`src/retry.js`); the exported `acme.axios` instance no longer retries anything by itself
     * Requests made directly through `acme.axios` (outside the client) are no longer retried on `429`, `5xx` or transport errors
-    * A missing or non-numeric `acmeSettings.retryMaxAttempts` now means no retries
+    * `acmeSettings` retry values may be numbers or numeric strings; a missing or invalid `retryMaxAttempts` means no retries, and a `retryMaxDelay` that is set but invalid means no `Retry-After` is slept on
+    * Without `Retry-After`, the per-attempt backoff is capped at `retryMaxDelay`
+* `changed` A retry that cannot get a nonce hands back the last response; the nonce failure is kept as the `cause` of the resulting `HttpError`
+* `fixed` `externalAccountBinding` is no longer written onto the caller's payload object
 
 ## v5.4.0 (2024-07-16)
 

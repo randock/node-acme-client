@@ -95,7 +95,7 @@ describe('http signed request retries (edge cases)', () => {
 
         nock(endpoint).post('/new-order').reply((uri, body) => {
             nonces.push(decode(body).header.nonce);
-            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '1', 'Replay-Nonce': 'from-the-429' }];
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Replay-Nonce': 'from-the-429' }];
         });
         nock(endpoint).post('/new-order').reply((uri, body) => {
             nonces.push(decode(body).header.nonce);
@@ -114,13 +114,15 @@ describe('http signed request retries (edge cases)', () => {
         // First nonce works, every later new-nonce request fails
         mockServer((n) => ((n === 1) ? [200, '', { 'Replay-Nonce': 'nonce-1' }] : [503, 'unavailable']));
 
-        nock(endpoint).persist().post('/new-order').reply(() => [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '1' }]);
+        nock(endpoint).persist().post('/new-order').reply(() => [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '0' }]);
 
         const client = new HttpClient(`${endpoint}/directory`, accountKey);
         const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
 
         assert.strictEqual(resp.status, 429);
-        assert.strictEqual(resp.headers['retry-after'], '1');
+        assert.strictEqual(resp.headers['retry-after'], '0');
+        assert.instanceOf(resp.retryNonceError, Error);
+        assert.strictEqual(nonceRequests, 2, 'the retry nonce must be fetched once, without retries of its own');
     });
 
     it('should stay bounded when bad nonces and rate limits alternate', async () => {
@@ -134,14 +136,119 @@ describe('http signed request retries (edge cases)', () => {
                 return [400, { type: 'urn:ietf:params:acme:error:badNonce' }, { 'Replay-Nonce': `replay-${posts}` }];
             }
 
-            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '1', 'Replay-Nonce': `replay-${posts}` }];
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Replay-Nonce': `replay-${posts}` }];
         });
 
         const client = new HttpClient(`${endpoint}/directory`, accountKey);
         const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
 
-        assert.oneOf(resp.status, [400, 429]);
-        assert.isAtMost(posts, 1 + client.maxBadNonceRetries + axios.defaults.acmeSettings.retryMaxAttempts);
+        // bad, 429, bad, 429, bad, 429, bad, 429: the fourth 429 exhausts retryMaxAttempts (3)
+        assert.strictEqual(resp.status, 429);
+        assert.strictEqual(posts, 8);
+    });
+
+    it('should not reset the bad nonce budget when a rate limit retry happens in between', async () => {
+        mockServer();
+        let posts = 0;
+
+        nock(endpoint).persist().post('/new-order').reply(() => {
+            posts += 1;
+
+            if (posts === 6) {
+                return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Replay-Nonce': `replay-${posts}` }];
+            }
+
+            return [400, { type: 'urn:ietf:params:acme:error:badNonce' }, { 'Replay-Nonce': `replay-${posts}` }];
+        });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        // 5 bad nonces use up the budget, the 429 is retried once, the next bad nonce is final
+        assert.strictEqual(resp.status, 400);
+        assert.strictEqual(posts, 7);
+    });
+
+    it('should fetch a fresh nonce instead of reusing one after a long wait', async () => {
+        mockServer();
+        const nonces = [];
+
+        nock(endpoint).post('/new-order').reply((uri, body) => {
+            nonces.push(decode(body).header.nonce);
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Replay-Nonce': 'possibly-stale' }];
+        });
+        nock(endpoint).post('/new-order').reply((uri, body) => {
+            nonces.push(decode(body).header.nonce);
+            return [201, { status: 'pending' }];
+        });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        client.replayNonceMaxAge = -1;
+        await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.notStrictEqual(nonces[1], 'possibly-stale');
+        assert.strictEqual(nonceRequests, 2);
+    });
+
+    it('should honour retry settings given as strings', async () => {
+        axios.defaults.acmeSettings = { retryMaxAttempts: '3', retryDefaultDelay: '0', retryMaxDelay: '120' };
+        mockServer();
+
+        let rateLimited = 0;
+        nock(endpoint).persist().post('/new-order').reply(() => {
+            rateLimited += 1;
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '3600', 'Replay-Nonce': 'n' }];
+        });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 429, 'a Retry-After above the string retryMaxDelay must be handed back');
+        assert.strictEqual(rateLimited, 1);
+
+        let unavailable = 0;
+        nock(endpoint).persist().get('/plain').reply(() => {
+            unavailable += 1;
+            return [503, 'unavailable'];
+        });
+
+        await client.request(`${endpoint}/plain`, 'get');
+        assert.strictEqual(unavailable, 4, 'a string retryMaxAttempts must still allow retries');
+    });
+
+    it('should not sleep on any Retry-After when retryMaxDelay is set but invalid', async () => {
+        axios.defaults.acmeSettings = { retryMaxAttempts: 3, retryDefaultDelay: 0, retryMaxDelay: 'soon' };
+        mockServer();
+
+        let posts = 0;
+        nock(endpoint).persist().post('/new-order').reply(() => {
+            posts += 1;
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '5', 'Replay-Nonce': 'n' }];
+        });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 429);
+        assert.strictEqual(posts, 1);
+    });
+
+    it('should carry the nonce failure as the cause of the HttpError', async () => {
+        mockServer((n) => ((n === 1) ? [200, '', { 'Replay-Nonce': 'nonce-1' }] : [503, 'unavailable']));
+        nock(endpoint).persist().post('/new-order').reply(() => [503, { type: 'urn:ietf:params:acme:error:serverInternal' }]);
+
+        const api = new AcmeApi(new HttpClient(`${endpoint}/directory`, accountKey), `${endpoint}/acct/1`);
+
+        try {
+            await api.apiRequest(`${endpoint}/new-order`, {}, [201]);
+            assert.fail('expected an HttpError');
+        }
+        catch (e) {
+            assert.instanceOf(e, HttpError);
+            assert.strictEqual(e.response.status, 503);
+            assert.instanceOf(e.cause, Error);
+            assert.match(e.cause.message, /Failed to get nonce/);
+        }
     });
 
     it('should keep the KID on every retry', async () => {
@@ -178,7 +285,7 @@ describe('http signed request retries (edge cases)', () => {
 
         nock(endpoint).post('/new-account').reply((uri, body) => {
             record(body);
-            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }, { 'Retry-After': '1' }];
+            return [429, { type: 'urn:ietf:params:acme:error:rateLimited' }];
         });
         nock(endpoint).post('/new-account').reply((uri, body) => {
             record(body);
@@ -189,9 +296,11 @@ describe('http signed request retries (edge cases)', () => {
             kid: 'eab-kid',
             hmacKey: randomBytes(32).toString('base64'),
         });
-        const resp = await client.signedRequest(`${endpoint}/new-account`, { termsOfServiceAgreed: true }, { includeExternalAccountBinding: true });
+        const payload = { termsOfServiceAgreed: true };
+        const resp = await client.signedRequest(`${endpoint}/new-account`, payload, { includeExternalAccountBinding: true });
 
         assert.strictEqual(resp.status, 201);
+        assert.notProperty(payload, 'externalAccountBinding', 'the caller payload must not be mutated');
         assert.deepStrictEqual(attempts, [
             { jwk: true, kid: undefined, eab: true },
             { jwk: true, kid: undefined, eab: true },

@@ -51,7 +51,9 @@ class AcmeApi {
         const resp = await this.http.signedRequest(url, payload, { kid, includeExternalAccountBinding });
 
         if (validStatusCodes.length && (validStatusCodes.indexOf(resp.status) === -1)) {
-            throw new HttpError(util.formatResponseError(resp), resp);
+            // A retry that could not get a nonce hands back the last response; keep why
+            const options = resp.retryNonceError ? { cause: resp.retryNonceError } : undefined;
+            throw new HttpError(util.formatResponseError(resp), resp, options);
         }
 
         return resp;

@@ -30,23 +30,38 @@ const MAX_TIMER_SECONDS = Math.floor(2147483647 / 1000);
 /**
  * Retry settings, read defensively
  *
- * A consumer may replace `acmeSettings` wholesale and leave fields out. A
- * missing or non-numeric `retryMaxAttempts` means no retries at all (as the old
- * interceptor behaved), so a bad configuration can never loop; a missing
- * `retryDefaultDelay` falls back to 5 seconds and a missing `retryMaxDelay` to
- * no cap.
+ * Values may be numbers or numeric strings (settings often come from env or
+ * config files). A consumer may also replace `acmeSettings` wholesale and leave
+ * fields out:
+ *
+ * - `retryMaxAttempts` missing or invalid: no retries at all, so a bad
+ *   configuration can never loop
+ * - `retryDefaultDelay` missing or invalid: 5 seconds
+ * - `retryMaxDelay` missing or null: no cap (the library default); set but
+ *   invalid: 0, so no Retry-After is slept on, rather than silently no cap
  *
  * @returns {{retryMaxAttempts: number, retryDefaultDelay: number, retryMaxDelay: (number|null)}}
  */
 
 function getRetrySettings() {
     const settings = axios.defaults.acmeSettings || {};
-    const finite = (value, fallback) => (Number.isFinite(value) && (value >= 0) ? value : fallback);
+    const toNumber = (value) => ((typeof value === 'string') && (value.trim() !== '') ? Number(value) : value);
+    const valid = (value) => Number.isFinite(value) && (value >= 0);
+
+    const maxAttempts = toNumber(settings.retryMaxAttempts);
+    const defaultDelay = toNumber(settings.retryDefaultDelay);
+    const maxDelay = toNumber(settings.retryMaxDelay);
+
+    let retryMaxDelay = null;
+
+    if ((maxDelay !== null) && (typeof maxDelay !== 'undefined')) {
+        retryMaxDelay = valid(maxDelay) ? maxDelay : 0;
+    }
 
     return {
-        retryMaxAttempts: finite(settings.retryMaxAttempts, 0),
-        retryDefaultDelay: finite(settings.retryDefaultDelay, 5),
-        retryMaxDelay: finite(settings.retryMaxDelay, null),
+        retryMaxAttempts: valid(maxAttempts) ? Math.floor(maxAttempts) : 0,
+        retryDefaultDelay: valid(defaultDelay) ? defaultDelay : 5,
+        retryMaxDelay,
     };
 }
 
@@ -87,11 +102,18 @@ function getRetryDelay({ response = null, error = null }, attempt) {
         return null;
     }
 
-    const retryAfter = parseRetryAfterHeader(response.headers['retry-after']);
+    const cap = (retryMaxDelay !== null) ? Math.min(retryMaxDelay, MAX_TIMER_SECONDS) : MAX_TIMER_SECONDS;
+    const header = response.headers['retry-after'];
+
+    // A number of seconds too large to parse safely is a very long wait, not none
+    if ((typeof header === 'string') && /^\s*\d+\s*$/.test(header) && !Number.isSafeInteger(Number(header))) {
+        log(`Retry-after of ${header.trim()} seconds exceeds the maximum delay of ${cap}, not retrying`);
+        return null;
+    }
+
+    const retryAfter = parseRetryAfterHeader(header);
 
     if (retryAfter > 0) {
-        const cap = (retryMaxDelay !== null) ? Math.min(retryMaxDelay, MAX_TIMER_SECONDS) : MAX_TIMER_SECONDS;
-
         if (retryAfter > cap) {
             log(`Retry-after of ${retryAfter} seconds exceeds the maximum delay of ${cap}, not retrying`);
             return null;
@@ -100,7 +122,8 @@ function getRetryDelay({ response = null, error = null }, attempt) {
         return retryAfter;
     }
 
-    return retryDefaultDelay * (attempt + 1);
+    // Without Retry-After, back off per attempt, but never past the cap
+    return Math.min(retryDefaultDelay * (attempt + 1), cap);
 }
 
 /**
