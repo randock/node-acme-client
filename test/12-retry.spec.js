@@ -58,14 +58,29 @@ describe('retry', () => {
             assert.isNull(getRetryDelay({ response: response(503) }, 3));
         });
 
-        it('should cap the default backoff at retryMaxDelay', () => {
-            axios.defaults.acmeSettings.retryDefaultDelay = 1000;
-            axios.defaults.acmeSettings.retryMaxDelay = 60;
-            assert.strictEqual(getRetryDelay({ response: response(503) }, 2), 60);
+        it('should not let retryMaxDelay shorten the own backoff', () => {
+            // retryMaxDelay bounds what a server asks for; a cap of 0 must not mean back-to-back retries
+            axios.defaults.acmeSettings.retryDefaultDelay = 5;
+            axios.defaults.acmeSettings.retryMaxDelay = 0;
+            assert.deepStrictEqual([0, 1, 2].map((a) => getRetryDelay({ response: response(503) }, a)), [5, 10, 15]);
+            assert.strictEqual(getRetryDelay({ error: { code: 'ECONNRESET' } }, 1), 10);
         });
 
-        it('should hand back a Retry-After too large to parse', () => {
-            assert.isNull(getRetryDelay({ response: response(429, { 'retry-after': '99999999999999999999' }) }, 0));
+        it('should keep the own backoff below the timer limit, for responses and transport errors', () => {
+            axios.defaults.acmeSettings.retryDefaultDelay = 3e6;
+            assert.isBelow(getRetryDelay({ response: response(503) }, 0), 2147484);
+            assert.isBelow(getRetryDelay({ error: { code: 'ECONNRESET' } }, 0), 2147484);
+        });
+
+        it('should hand back a Retry-After too large to parse, in any spelling', () => {
+            axios.defaults.acmeSettings.retryMaxDelay = 120;
+            ['99999999999999999999', ' 99999999999999999999 ', '+99999999999999999999', '1e30', ['99999999999999999999']].forEach((header) => {
+                assert.isNull(getRetryDelay({ response: response(429, { 'retry-after': header }) }, 0), JSON.stringify(header));
+            });
+        });
+
+        it('should round a fractional Retry-After up', () => {
+            assert.strictEqual(getRetryDelay({ response: response(429, { 'retry-after': '1.5' }) }, 0), 2);
         });
 
         it('should read numeric strings in the settings', () => {

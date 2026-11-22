@@ -202,6 +202,7 @@ export function setLogger(fn: (msg: string) => void): void;
  * Errors
  */
 export class HttpError extends Error {
-    constructor(message?: string, response?: AxiosResponse);
+    constructor(message?: string, response?: AxiosResponse, options?: { cause?: unknown });
     response?: AxiosResponse;
+    cause?: unknown;
 }

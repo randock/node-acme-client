@@ -38,7 +38,8 @@ const MAX_TIMER_SECONDS = Math.floor(2147483647 / 1000);
  *   configuration can never loop
  * - `retryDefaultDelay` missing or invalid: 5 seconds
  * - `retryMaxDelay` missing or null: no cap (the library default); set but
- *   invalid: 0, so no Retry-After is slept on, rather than silently no cap
+ *   invalid: 0, so no Retry-After is slept on, rather than silently no cap.
+ *   It bounds Retry-After only, never the own backoff
  *
  * @returns {{retryMaxAttempts: number, retryDefaultDelay: number, retryMaxDelay: (number|null)}}
  */
@@ -66,6 +67,28 @@ function getRetrySettings() {
 }
 
 /**
+ * Seconds a Retry-After header asks for, 0 when absent or in the past
+ *
+ * Takes the first value of a repeated header. A delay in seconds is read as a
+ * number, so values too large for parseInt (or written as 1e30) are a very
+ * long wait rather than none; anything else is read as an HTTP date.
+ *
+ * @param {string|string[]|undefined} header Retry-After header
+ * @returns {number} Seconds
+ */
+
+function getRetryAfterSeconds(header) {
+    const value = Array.isArray(header) ? header[0] : header;
+
+    if ((typeof value === 'string') && /^\s*\+?\d+(\.\d+)?(e\+?\d+)?\s*$/i.test(value)) {
+        const seconds = Number(value);
+        return Number.isFinite(seconds) ? Math.ceil(seconds) : Infinity;
+    }
+
+    return parseRetryAfterHeader(value);
+}
+
+/**
  * Seconds to wait before trying a request again, or null to give up
  *
  * Rate limits (429), server errors (5xx) and transport failures are retried,
@@ -88,12 +111,17 @@ function getRetryDelay({ response = null, error = null }, attempt) {
         return null;
     }
 
+    // Own backoff, used when the server gives no Retry-After. retryMaxDelay
+    // only bounds what a server asks for; it does not shorten our own backoff,
+    // so a cap of 0 cannot turn retries into back-to-back requests.
+    const backoff = Math.min(retryDefaultDelay * (attempt + 1), MAX_TIMER_SECONDS);
+
     if (!response) {
         if (!error || NON_RETRYABLE_CODES.includes(error.code)) {
             return null;
         }
 
-        return retryDefaultDelay * (attempt + 1);
+        return backoff;
     }
 
     const retryable = (response.status === 429) || ((response.status >= 500) && (response.status <= 599));
@@ -103,15 +131,7 @@ function getRetryDelay({ response = null, error = null }, attempt) {
     }
 
     const cap = (retryMaxDelay !== null) ? Math.min(retryMaxDelay, MAX_TIMER_SECONDS) : MAX_TIMER_SECONDS;
-    const header = response.headers['retry-after'];
-
-    // A number of seconds too large to parse safely is a very long wait, not none
-    if ((typeof header === 'string') && /^\s*\d+\s*$/.test(header) && !Number.isSafeInteger(Number(header))) {
-        log(`Retry-after of ${header.trim()} seconds exceeds the maximum delay of ${cap}, not retrying`);
-        return null;
-    }
-
-    const retryAfter = parseRetryAfterHeader(header);
+    const retryAfter = getRetryAfterSeconds(response.headers['retry-after']);
 
     if (retryAfter > 0) {
         if (retryAfter > cap) {
@@ -122,8 +142,7 @@ function getRetryDelay({ response = null, error = null }, attempt) {
         return retryAfter;
     }
 
-    // Without Retry-After, back off per attempt, but never past the cap
-    return Math.min(retryDefaultDelay * (attempt + 1), cap);
+    return backoff;
 }
 
 /**

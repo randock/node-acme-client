@@ -122,7 +122,9 @@ describe('http signed request retries (edge cases)', () => {
         assert.strictEqual(resp.status, 429);
         assert.strictEqual(resp.headers['retry-after'], '0');
         assert.instanceOf(resp.retryNonceError, Error);
-        assert.strictEqual(nonceRequests, 2, 'the retry nonce must be fetched once, without retries of its own');
+        assert.notInclude(Object.keys(resp), 'retryNonceError', 'the nonce error must stay out of logged responses');
+        // 1 nonce for the request, then 1 per retry of the 3 in the budget: no nested nonce retries
+        assert.strictEqual(nonceRequests, 4);
     });
 
     it('should stay bounded when bad nonces and rate limits alternate', async () => {
@@ -188,6 +190,95 @@ describe('http signed request retries (edge cases)', () => {
 
         assert.notStrictEqual(nonces[1], 'possibly-stale');
         assert.strictEqual(nonceRequests, 2);
+    });
+
+    it('should survive a network blip that also hits the first retry nonce', async () => {
+        // nonce 1 works, nonce 2 hits the same outage, nonce 3 works again
+        let heads = 0;
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [200, '', { 'Replay-Nonce': 'n1' }]; });
+        nock(endpoint).head('/new-nonce').replyWithError({ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED' });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [200, '', { 'Replay-Nonce': 'n3' }]; });
+
+        nock(endpoint).post('/new-order').replyWithError({ code: 'ECONNREFUSED', message: 'connect ECONNREFUSED' });
+        nock(endpoint).post('/new-order').reply(() => [201, { status: 'pending' }]);
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 201);
+        assert.strictEqual(heads, 2);
+    });
+
+    it('should not give up a server error retry on one failed nonce fetch', async () => {
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'n1' });
+        nock(endpoint).head('/new-nonce').reply(503, 'unavailable');
+        nock(endpoint).head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'n3' });
+
+        nock(endpoint).post('/new-order').reply(503, { type: 'urn:ietf:params:acme:error:serverInternal' });
+        nock(endpoint).post('/new-order').reply(201, { status: 'pending' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 201);
+    });
+
+    it('should keep the nonce failure on a rethrown transport error, without replacing its cause', async () => {
+        mockServer((n) => ((n === 1) ? [200, '', { 'Replay-Nonce': 'nonce-1' }] : [503, 'unavailable']));
+        nock(endpoint).persist().post('/new-order').replyWithError({ code: 'ECONNRESET', message: 'socket hang up' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+
+        try {
+            await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+            assert.fail('expected the transport error');
+        }
+        catch (e) {
+            assert.strictEqual(e.code, 'ECONNRESET');
+            // axios already sets the socket error as cause; it is kept, the nonce failure rides along
+            assert.isDefined(e.cause);
+            assert.notMatch(String(e.cause && e.cause.message), /Failed to get nonce/);
+            assert.instanceOf(e.retryNonceError, Error);
+            assert.match(e.retryNonceError.message, /Failed to get nonce/);
+            assert.notInclude(Object.keys(e), 'retryNonceError');
+        }
+    });
+
+    it('should reuse a Replay-Nonce up to replayNonceMaxAge seconds, and fetch a fresh one after', async () => {
+        mockServer();
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = { headers: { 'replay-nonce': 'from-response' } };
+
+        assert.strictEqual((await client.getRetryNonce(resp, 30)).nonce, 'from-response');
+        assert.strictEqual(nonceRequests, 0);
+
+        assert.notStrictEqual((await client.getRetryNonce(resp, 31)).nonce, 'from-response');
+        assert.strictEqual(nonceRequests, 1);
+    });
+
+    it('should fetch a retry nonce from the cached directory, even when it is stale', async () => {
+        let directoryGets = 0;
+        nock(endpoint).persist().get('/directory').reply(() => { directoryGets += 1; return [200, { newNonce: `${endpoint}/new-nonce` }]; });
+        nock(endpoint).persist().head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'fresh' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        await client.getDirectory();
+        client.directoryTimestamp = 0;
+
+        const { nonce } = await client.getRetryNonce(null, 0);
+
+        assert.strictEqual(nonce, 'fresh');
+        assert.strictEqual(directoryGets, 1);
+    });
+
+    it('should keep the cause on HttpError', () => {
+        const cause = new Error('why');
+        const e = new HttpError('message', { status: 503 }, { cause });
+
+        assert.strictEqual(e.cause, cause);
+        assert.strictEqual(e.response.status, 503);
     });
 
     it('should honour retry settings given as strings', async () => {
