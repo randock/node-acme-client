@@ -28,6 +28,12 @@ const NON_RETRYABLE_CODES = ['ECONNABORTED', 'ERR_NOCK_NO_MATCH'];
 const MAX_TIMER_SECONDS = Math.floor(2147483647 / 1000);
 
 /**
+ * A wait this long is allowed but almost certainly a misconfiguration
+ */
+
+const LONG_WAIT_SECONDS = 3600;
+
+/**
  * Retry settings, read defensively
  *
  * Values may be numbers or numeric strings (settings often come from env or
@@ -156,8 +162,12 @@ function getRetryDelay({ response = null, error = null }, attempt) {
  */
 
 function waitForRetry({ response = null, error = null }, delay, attempt, url) {
-    const cause = response ? `HTTP ${response.status}` : (error && error.code) || 'transport error';
+    const cause = response ? `HTTP ${response.status}` : (error && (error.code || error.message)) || 'transport error';
     log(`Caught ${cause}, retry attempt ${attempt}/${getRetrySettings().retryMaxAttempts} to URL ${url}, waiting ${delay} seconds`);
+
+    if (delay > LONG_WAIT_SECONDS) {
+        log(`Warning: waiting ${delay} seconds before retrying ${url}; check retryDefaultDelay and retryMaxDelay`);
+    }
 
     return new Promise((resolve) => { setTimeout(resolve, (delay * 1000)); });
 }

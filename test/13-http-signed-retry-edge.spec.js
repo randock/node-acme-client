@@ -273,6 +273,51 @@ describe('http signed request retries (edge cases)', () => {
         assert.strictEqual(directoryGets, 1);
     });
 
+    it('should honour the Retry-After of the nonce endpoint itself', async () => {
+        axios.defaults.acmeSettings.retryMaxDelay = 5;
+        let heads = 0;
+
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [200, '', { 'Replay-Nonce': 'n1' }]; });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [429, '', { 'Retry-After': '7' }]; });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [200, '', { 'Replay-Nonce': 'n3' }]; });
+
+        nock(endpoint).post('/new-order').reply(503, { type: 'urn:ietf:params:acme:error:serverInternal' });
+        nock(endpoint).post('/new-order').reply(201, { status: 'pending' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        // The nonce endpoint asks for 7 s, above retryMaxDelay: hand back instead of retrying on our own backoff
+        assert.strictEqual(resp.status, 503);
+        assert.strictEqual(heads, 2);
+        assert.match(resp.retryNonceError.message, /HTTP 429/);
+    });
+
+    it('should keep bad nonce retries within their own budget when nonce fetches fail', async () => {
+        axios.defaults.acmeSettings.retryMaxAttempts = 10;
+        mockServer((n) => ((n % 2) ? [200, '', { 'Replay-Nonce': `nonce-${n}` }] : [503, 'unavailable']));
+
+        let posts = 0;
+        nock(endpoint).persist().post('/new-order').reply(() => {
+            posts += 1;
+            return [400, { type: 'urn:ietf:params:acme:error:badNonce' }];
+        });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 400);
+        assert.isAtMost(posts, 1 + client.maxBadNonceRetries);
+    });
+
+    it('should rethrow a frozen transport error untouched', () => {
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const frozen = Object.freeze(Object.assign(new Error('frozen'), { code: 'ECONNRESET' }));
+
+        assert.throws(() => client.giveUpRetry({ error: frozen }, new Error('nonce')), 'frozen');
+    });
+
     it('should keep the cause on HttpError', () => {
         const cause = new Error('why');
         const e = new HttpError('message', { status: 503 }, { cause });

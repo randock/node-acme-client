@@ -73,4 +73,10 @@ import * as acme from 'acme-client';
         challengeCreateFn: async (authz, challenge, keyAuthorization) => {},
         challengeRemoveFn: async (authz, challenge, keyAuthorization) => {}
     });
+
+    // HttpError
+    const httpError = new acme.HttpError('rate limited', undefined, { cause: new Error('why') });
+    const httpCause: unknown = httpError.cause;
+    const httpResponse = httpError.response;
+    new acme.HttpError('message');
 })();

@@ -6,7 +6,8 @@ const { randomUUID: uuid } = require('crypto');
 const { assert } = require('chai');
 const nock = require('nock');
 const axios = require('./../src/axios');
-const { getRetryDelay, retryIdempotent } = require('./../src/retry');
+const { getRetryDelay, retryIdempotent, waitForRetry } = require('./../src/retry');
+const { setLogger } = require('./../src/logger');
 
 describe('retry', () => {
     const endpoint = `http://${uuid()}.example.com`;
@@ -93,6 +94,22 @@ describe('retry', () => {
         it('should retry transport failures, except aborted requests', () => {
             assert.strictEqual(getRetryDelay({ error: { code: 'ECONNRESET' } }, 0), 0);
             assert.isNull(getRetryDelay({ error: { code: 'ECONNABORTED' } }, 0));
+        });
+    });
+
+    describe('waitForRetry', () => {
+        it('should name a failure without an error code by its message', async () => {
+            const lines = [];
+            setLogger((msg) => lines.push(msg));
+
+            try {
+                await waitForRetry({ error: new Error('Failed to get nonce from ACME provider (HTTP 503)') }, 0, 1, `${endpoint}/new-nonce`);
+            }
+            finally {
+                setLogger(() => {});
+            }
+
+            assert.match(lines.join('\n'), /Caught Failed to get nonce from ACME provider \(HTTP 503\)/);
         });
     });
 
