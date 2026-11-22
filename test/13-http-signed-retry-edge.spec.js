@@ -307,8 +307,62 @@ describe('http signed request retries (edge cases)', () => {
         const client = new HttpClient(`${endpoint}/directory`, accountKey);
         const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
 
+        // Every bad nonce is retried until the bad nonce budget (5) is spent: exactly 1 + 5 POSTs
         assert.strictEqual(resp.status, 400);
-        assert.isAtMost(posts, 1 + client.maxBadNonceRetries);
+        assert.strictEqual(posts, 1 + client.maxBadNonceRetries);
+    });
+
+    it('should honour the nonce endpoint Retry-After after a bad nonce without Replay-Nonce', async () => {
+        axios.defaults.acmeSettings.retryMaxDelay = 5;
+        let heads = 0;
+
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(() => { heads += 1; return [200, '', { 'Replay-Nonce': 'n1' }]; });
+        nock(endpoint).persist().head('/new-nonce').reply(() => { heads += 1; return [429, '', { 'Retry-After': '7' }]; });
+        nock(endpoint).persist().post('/new-order').reply(400, { type: 'urn:ietf:params:acme:error:badNonce' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        // 7 s is above retryMaxDelay: hand the bad nonce back, no own-backoff retries of the nonce
+        assert.strictEqual(resp.status, 400);
+        assert.strictEqual(heads, 2);
+    });
+
+    it('should retry a nonce response that succeeds without a Replay-Nonce', async () => {
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'n1' });
+        nock(endpoint).head('/new-nonce').reply(200, '');
+        nock(endpoint).head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'n3' });
+
+        nock(endpoint).post('/new-order').reply(503, { type: 'urn:ietf:params:acme:error:serverInternal' });
+        nock(endpoint).post('/new-order').reply(201, { status: 'pending' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+        const resp = await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+
+        assert.strictEqual(resp.status, 201);
+    });
+
+    it('should expose the nonce endpoint response on the cause', async () => {
+        axios.defaults.acmeSettings.retryMaxDelay = 120;
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).head('/new-nonce').reply(200, '', { 'Replay-Nonce': 'n1' });
+        nock(endpoint).persist().head('/new-nonce').reply(429, '', { 'Retry-After': '3600' });
+        nock(endpoint).persist().post('/new-order').reply(503, { type: 'urn:ietf:params:acme:error:serverInternal' });
+
+        const api = new AcmeApi(new HttpClient(`${endpoint}/directory`, accountKey), `${endpoint}/acct/1`);
+
+        try {
+            await api.apiRequest(`${endpoint}/new-order`, {}, [201]);
+            assert.fail('expected an HttpError');
+        }
+        catch (e) {
+            assert.strictEqual(e.response.status, 503);
+            assert.instanceOf(e.cause, HttpError);
+            assert.strictEqual(e.cause.response.status, 429);
+            assert.strictEqual(e.cause.response.headers['retry-after'], '3600');
+        }
     });
 
     it('should rethrow a frozen transport error untouched', () => {

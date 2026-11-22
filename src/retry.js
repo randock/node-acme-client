@@ -166,7 +166,7 @@ function waitForRetry({ response = null, error = null }, delay, attempt, url) {
     log(`Caught ${cause}, retry attempt ${attempt}/${getRetrySettings().retryMaxAttempts} to URL ${url}, waiting ${delay} seconds`);
 
     if (delay > LONG_WAIT_SECONDS) {
-        log(`Warning: waiting ${delay} seconds before retrying ${url}; check retryDefaultDelay and retryMaxDelay`);
+        log(`Warning: waiting ${delay} seconds before retrying ${url}; set retryMaxDelay to hand long waits back instead`);
     }
 
     return new Promise((resolve) => { setTimeout(resolve, (delay * 1000)); });

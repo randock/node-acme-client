@@ -7,6 +7,7 @@ const { getJwk } = require('./crypto');
 const { log } = require('./logger');
 const axios = require('./axios');
 const { getRetryDelay, waitForRetry, retryIdempotent } = require('./retry');
+const HttpError = require('./error/http');
 
 /**
  * ACME HTTP client
@@ -513,11 +514,15 @@ class HttpClient {
             const nonceResp = await this.send(url, 'head');
 
             if (!nonceResp.headers['replay-nonce']) {
-                const error = new Error(`Failed to get nonce from ACME provider (HTTP ${nonceResp.status})`);
+                // An HttpError, so whoever ends up with it can read the nonce endpoint's Retry-After
+                const error = new HttpError(`Failed to get nonce from ACME provider (HTTP ${nonceResp.status})`, nonceResp);
                 log(`Could not get a fresh nonce for the retry: ${error.message}`);
 
-                // The response lets the caller honour the nonce endpoint's own Retry-After
-                return { nonce: null, error, response: nonceResp };
+                /* An error status decides the wait itself: its Retry-After for 429/5xx,
+                   giving up for other 4xx. A success without a nonce (a proxy dropping
+                   the header) is treated like a transport failure and retried on the
+                   own backoff. */
+                return { nonce: null, error, response: (nonceResp.status >= 400) ? nonceResp : null };
             }
 
             return { nonce: nonceResp.headers['replay-nonce'], error: null, response: null };

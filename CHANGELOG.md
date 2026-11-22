@@ -12,6 +12,7 @@
     * `Retry-After` values in seconds are read as numbers (repeated headers use the first value); values too large to sleep on are handed back
 * `changed` A retry that cannot get a nonce tries again within the same retry budget; once that is spent it hands back the last response (or rethrows the transport error), with the nonce failure kept as non-enumerable `retryNonceError` and as the `cause` of the resulting `HttpError`
 * `added` `HttpError` accepts `{ cause }` as a third argument (also on Node < 16.9)
+    * When the nonce endpoint itself fails during a retry, the cause is an `HttpError` with that endpoint's response, so its `Retry-After` stays readable
 * `fixed` `externalAccountBinding` is no longer written onto the caller's payload object
 
 ## v5.4.0 (2024-07-16)
