@@ -372,6 +372,25 @@ describe('http signed request retries (edge cases)', () => {
         assert.throws(() => client.giveUpRetry({ error: frozen }, new Error('nonce')), 'frozen');
     });
 
+    it('should report a rate limited first nonce as an HttpError with the response', async () => {
+        axios.defaults.acmeSettings.retryMaxDelay = 120;
+        nock(endpoint).persist().get('/directory').reply(200, { newNonce: `${endpoint}/new-nonce`, newOrder: `${endpoint}/new-order` });
+        nock(endpoint).persist().head('/new-nonce').reply(429, '', { 'Retry-After': '3600' });
+
+        const client = new HttpClient(`${endpoint}/directory`, accountKey);
+
+        try {
+            await client.signedRequest(`${endpoint}/new-order`, {}, { kid: 'kid-1' });
+            assert.fail('expected an HttpError');
+        }
+        catch (e) {
+            assert.instanceOf(e, HttpError);
+            assert.strictEqual(e.response.status, 429);
+            assert.strictEqual(e.response.headers['retry-after'], '3600');
+            assert.match(e.message, /Failed to get nonce from ACME provider \(HTTP 429\)/);
+        }
+    });
+
     it('should keep the cause on HttpError', () => {
         const cause = new Error('why');
         const e = new HttpError('message', { status: 503 }, { cause });

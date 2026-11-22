@@ -5,6 +5,7 @@
 * `fixed` Retried ACME requests are signed again with a fresh nonce instead of resending a spent one, so a `429` on a signed request no longer surfaces as `badNonce`
 * `fixed` A failed nonce fetch while retrying hands back the original `429`/`5xx` response instead of a generic "Failed to get nonce" error
 * `fixed` ARI renewal info errors are thrown as `HttpError` with the response, like other ACME API errors
+* `fixed` A failure to get the first nonce of a request is thrown as `HttpError` with the nonce response, so a rate limited new-nonce endpoint can be recognised
 * `changed` All request retries happen in the ACME HTTP client (`src/retry.js`); the exported `acme.axios` instance no longer retries anything by itself
     * Requests made directly through `acme.axios` (outside the client) are no longer retried on `429`, `5xx` or transport errors
     * `acmeSettings` retry values may be numbers or numeric strings; a missing or invalid `retryMaxAttempts` means no retries, and a `retryMaxDelay` that is set but invalid means no `Retry-After` is slept on

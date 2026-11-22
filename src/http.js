@@ -140,7 +140,8 @@ class HttpClient {
         const resp = await this.request(url, 'head');
 
         if (!resp.headers['replay-nonce']) {
-            throw new Error('Failed to get nonce from ACME provider');
+            // With the response, so a rate limited nonce endpoint can be recognised and waited out
+            throw new HttpError(`Failed to get nonce from ACME provider (HTTP ${resp.status})`, resp);
         }
 
         return resp.headers['replay-nonce'];
