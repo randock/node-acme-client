@@ -3,8 +3,6 @@
  */
 
 const axios = require('axios');
-const { parseRetryAfterHeader } = require('./util');
-const { log } = require('./logger');
 const pkg = require('./../package.json');
 
 const { AxiosError } = axios;
@@ -38,20 +36,6 @@ instance.defaults.acmeSettings = {
 
 instance.defaults.adapter = 'http';
 
-/**
- * Retry requests on server errors or when rate limited
- *
- * https://datatracker.ietf.org/doc/html/rfc8555#section-6.6
- */
-
-function isRetryableError(error) {
-    return (error.code !== 'ECONNABORTED')
-        && (error.code !== 'ERR_NOCK_NO_MATCH')
-        && (!error.response
-            || (error.response.status === 429)
-            || ((error.response.status >= 500) && (error.response.status <= 599)));
-}
-
 // https://github.com/axios/axios/blob/main/lib/core/settle.js
 function validateStatus(response) {
     const validator = response.config.retryValidateStatus;
@@ -79,63 +63,18 @@ instance.interceptors.request.use((config) => {
     return config;
 });
 
-// Handle request retries if applicable
+/* Hand every response back as is. Retries are not done here: a signed ACME
+   request cannot be sent again unchanged (its nonce is single use), so the
+   retry policy lives in retry.js and is applied by HttpClient, which knows
+   whether a request has to be signed again. */
 instance.interceptors.response.use(null, async (error) => {
     const { config, response } = error;
 
-    if (!config) {
+    // Transport failure, or not one of our requests: nothing to validate
+    if (!config || !response) {
         return Promise.reject(error);
     }
 
-    /* A signed ACME request carries a single-use nonce, so sending the same body
-       again is always rejected with badNonce. Those requests opt out here and are
-       retried by HttpClient.signedRequest, which signs them again with a fresh
-       nonce. */
-    if (config.acmeRetry === false) {
-        return response ? validateStatus(response) : Promise.reject(error);
-    }
-
-    // Pick up errors we want to retry
-    if (isRetryableError(error)) {
-        const { retryMaxAttempts, retryDefaultDelay, retryMaxDelay } = instance.defaults.acmeSettings;
-        config.retryAttempt = ('retryAttempt' in config) ? (config.retryAttempt + 1) : 1;
-
-        if (config.retryAttempt <= retryMaxAttempts) {
-            const code = response ? `HTTP ${response.status}` : error.code;
-            log(`Caught ${code}, retry attempt ${config.retryAttempt}/${retryMaxAttempts} to URL ${config.url}`);
-
-            // Attempt to parse Retry-After header, fallback to default delay
-            let retryAfter = response ? parseRetryAfterHeader(response.headers['retry-after']) : 0;
-
-            if (retryAfter > 0) {
-                log(`Found retry-after response header with value: ${response.headers['retry-after']}, waiting ${retryAfter} seconds`);
-
-                /* Hand long rate limits back to the caller instead of sleeping on them.
-                   A provider may ask us to wait hours or days, which is a decision for
-                   the caller to make, not something to sit out inside a request. */
-                if ((retryMaxDelay !== null) && (retryAfter > retryMaxDelay)) {
-                    log(`Retry-after of ${retryAfter} seconds exceeds retryMaxDelay of ${retryMaxDelay}, not retrying`);
-                    return validateStatus(response);
-                }
-            }
-            else {
-                retryAfter = (retryDefaultDelay * config.retryAttempt);
-                log(`Unable to locate or parse retry-after response header, waiting ${retryAfter} seconds`);
-            }
-
-            // Wait and retry the request
-            await new Promise((resolve) => { setTimeout(resolve, (retryAfter * 1000)); });
-            return instance(config);
-        }
-    }
-
-    /* Transport level failure, there is no response to validate. Reject with the
-       original error rather than tripping over an undefined response below. */
-    if (!response) {
-        return Promise.reject(error);
-    }
-
-    // Validate and return response
     return validateStatus(response);
 });
 

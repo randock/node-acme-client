@@ -6,6 +6,7 @@ const dns = require('dns').promises;
 const https = require('https');
 const { log } = require('./logger');
 const axios = require('./axios');
+const { retryIdempotent } = require('./retry');
 const util = require('./util');
 const { isAlpnCertificateAuthorizationValid } = require('./crypto');
 
@@ -30,7 +31,7 @@ async function verifyHttpChallenge(authz, challenge, keyAuthorization, suffix = 
     const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
     log(`Sending HTTP query to ${authz.identifier.value}, suffix: ${suffix}, port: ${httpPort}`);
-    const resp = await axios.get(challengeUrl, { httpsAgent });
+    const resp = await retryIdempotent(() => axios.get(challengeUrl, { httpsAgent }), challengeUrl);
     const data = (resp.data || '').replace(/\s+$/, '');
 
     log(`Query successful, HTTP status code: ${resp.status}`);

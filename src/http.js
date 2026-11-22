@@ -6,7 +6,7 @@ const { createHmac, createSign, constants: { RSA_PKCS1_PADDING } } = require('cr
 const { getJwk } = require('./crypto');
 const { log } = require('./logger');
 const axios = require('./axios');
-const { parseRetryAfterHeader } = require('./util');
+const { getRetryDelay, waitForRetry, retryIdempotent } = require('./retry');
 
 /**
  * ACME HTTP client
@@ -34,7 +34,11 @@ class HttpClient {
     }
 
     /**
-     * HTTP request
+     * HTTP request, retried under the retry policy
+     *
+     * For requests that are safe to send again unchanged: directory, new-nonce,
+     * ARI renewal info. Signed requests go through signedRequest, which signs a
+     * retry again with a fresh nonce.
      *
      * @param {string} url HTTP URL
      * @param {string} method HTTP method
@@ -43,6 +47,20 @@ class HttpClient {
      */
 
     async request(url, method, opts = {}) {
+        return retryIdempotent(() => this.send(url, method, opts), url);
+    }
+
+    /**
+     * HTTP request, sent exactly once
+     *
+     * @private
+     * @param {string} url HTTP URL
+     * @param {string} method HTTP method
+     * @param {object} [opts] Request options
+     * @returns {Promise<object>} HTTP response
+     */
+
+    async send(url, method, opts = {}) {
         opts.url = url;
         opts.method = method;
         opts.validateStatus = null;
@@ -322,21 +340,19 @@ class HttpClient {
         let resp;
 
         try {
-            resp = await this.request(url, 'post', { data, acmeRetry: false });
+            resp = await this.send(url, 'post', { data });
         }
         catch (e) {
-            // Transport failure, no response: sign again with a fresh nonce
-            const { retryMaxAttempts, retryDefaultDelay } = axios.defaults.acmeSettings;
+            // Transport failure: sign again with a fresh nonce, never replay
+            const outcome = { error: e };
+            const delay = getRetryDelay(outcome, retryAttempt);
 
-            if (e.response || (e.code === 'ECONNABORTED') || (retryAttempt >= retryMaxAttempts)) {
+            if (e.response || (delay === null)) {
                 throw e;
             }
 
             retryAttempt += 1;
-            const retryDelay = retryDefaultDelay * retryAttempt;
-
-            log(`Caught ${e.code}, retry attempt ${retryAttempt}/${retryMaxAttempts} with a fresh nonce to URL ${url}, waiting ${retryDelay} seconds`);
-            await new Promise((resolve) => { setTimeout(resolve, (retryDelay * 1000)); });
+            await waitForRetry(outcome, delay, retryAttempt, url);
 
             return this.signedRequest(url, payload, {
                 kid, nonce: null, includeExternalAccountBinding, retryAttempt,
@@ -355,14 +371,13 @@ class HttpClient {
             }, attempts);
         }
 
-        // Retry rate limits and server errors, signed again with a fresh nonce
-        const retryDelay = this.getSignedRetryDelay(resp, retryAttempt);
+        // Rate limits and server errors: sign again with a fresh nonce, never replay
+        const outcome = { response: resp };
+        const delay = getRetryDelay(outcome, retryAttempt);
 
-        if (retryDelay !== null) {
+        if (delay !== null) {
             retryAttempt += 1;
-
-            log(`Caught HTTP ${resp.status}, retry attempt ${retryAttempt}/${axios.defaults.acmeSettings.retryMaxAttempts} with a fresh nonce to URL ${url}, waiting ${retryDelay} seconds`);
-            await new Promise((resolve) => { setTimeout(resolve, (retryDelay * 1000)); });
+            await waitForRetry(outcome, delay, retryAttempt, url);
 
             return this.signedRequest(url, payload, {
                 kid, nonce: null, includeExternalAccountBinding, retryAttempt,
@@ -371,40 +386,6 @@ class HttpClient {
 
         // Return response
         return resp;
-    }
-
-    /**
-     * Seconds to wait before signing a failed request again, or null to hand
-     * the response back. Same rules as the HTTP layer applies to other
-     * requests: rate limits and server errors only, Retry-After honoured, and
-     * a Retry-After above retryMaxDelay returned to the caller.
-     *
-     * @private
-     * @param {object} resp HTTP response
-     * @param {number} retryAttempt Retries done so far
-     * @returns {number|null} Delay in seconds, or null
-     */
-
-    getSignedRetryDelay(resp, retryAttempt) {
-        const retryable = (resp.status === 429) || ((resp.status >= 500) && (resp.status <= 599));
-        const { retryMaxAttempts, retryDefaultDelay, retryMaxDelay } = axios.defaults.acmeSettings;
-
-        if (!retryable || (retryAttempt >= retryMaxAttempts)) {
-            return null;
-        }
-
-        const retryAfter = parseRetryAfterHeader(resp.headers['retry-after']);
-
-        if (retryAfter > 0) {
-            if ((retryMaxDelay !== null) && (retryAfter > retryMaxDelay)) {
-                log(`Retry-after of ${retryAfter} seconds exceeds retryMaxDelay of ${retryMaxDelay}, not retrying`);
-                return null;
-            }
-
-            return retryAfter;
-        }
-
-        return retryDefaultDelay * (retryAttempt + 1);
     }
 }
 
