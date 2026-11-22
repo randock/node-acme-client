@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased (randock fork)
+
+* `fixed` Retried ACME requests are signed again with a fresh nonce instead of resending a spent one, so a `429` on a signed request no longer surfaces as `badNonce`
+* `fixed` A failed nonce fetch while retrying hands back the original `429`/`5xx` response instead of a generic "Failed to get nonce" error
+* `fixed` ARI renewal info errors are thrown as `HttpError` with the response, like other ACME API errors
+* `fixed` A failure to get the first nonce of a request is thrown as `HttpError` with the nonce response, so a rate limited new-nonce endpoint can be recognised
+* `changed` All request retries happen in the ACME HTTP client (`src/retry.js`); the exported `acme.axios` instance no longer retries anything by itself
+    * Requests made directly through `acme.axios` (outside the client) are no longer retried on `429`, `5xx` or transport errors
+    * `acmeSettings` retry values may be numbers or numeric strings; a missing or invalid `retryMaxAttempts` means no retries, and a `retryMaxDelay` that is set but invalid means no `Retry-After` is slept on
+    * `retryMaxDelay` bounds the `Retry-After` a server asks for, never the client's own backoff (`retryDefaultDelay` per attempt), which only stays below the timer limit
+    * `Retry-After` values in seconds are read as numbers (repeated headers use the first value); values too large to sleep on are handed back
+* `changed` A retry that cannot get a nonce tries again within the same retry budget; once that is spent it hands back the last response (or rethrows the transport error), with the nonce failure kept as non-enumerable `retryNonceError` and as the `cause` of the resulting `HttpError`
+* `added` `HttpError` accepts `{ cause }` as a third argument (also on Node < 16.9)
+    * When the nonce endpoint itself fails during a retry, the cause is an `HttpError` with that endpoint's response, so its `Retry-After` stays readable
+* `fixed` `externalAccountBinding` is no longer written onto the caller's payload object
+
 ## v5.4.0 (2024-07-16)
 
 * `added` Directory URLs for [Google](https://cloud.google.com/certificate-manager/docs/overview) ACME provider

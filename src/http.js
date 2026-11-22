@@ -6,6 +6,8 @@ const { createHmac, createSign, constants: { RSA_PKCS1_PADDING } } = require('cr
 const { getJwk } = require('./crypto');
 const { log } = require('./logger');
 const axios = require('./axios');
+const { getRetryDelay, waitForRetry, retryIdempotent } = require('./retry');
+const HttpError = require('./error/http');
 
 /**
  * ACME HTTP client
@@ -25,6 +27,7 @@ class HttpClient {
         this.externalAccountBinding = externalAccountBinding;
 
         this.maxBadNonceRetries = 5;
+        this.replayNonceMaxAge = 30;
         this.jwk = null;
 
         this.directoryCache = null;
@@ -33,7 +36,11 @@ class HttpClient {
     }
 
     /**
-     * HTTP request
+     * HTTP request, retried under the retry policy
+     *
+     * For requests that are safe to send again unchanged: directory, new-nonce,
+     * ARI renewal info. Signed requests go through signedRequest, which signs a
+     * retry again with a fresh nonce.
      *
      * @param {string} url HTTP URL
      * @param {string} method HTTP method
@@ -42,6 +49,20 @@ class HttpClient {
      */
 
     async request(url, method, opts = {}) {
+        return retryIdempotent(() => this.send(url, method, opts), url);
+    }
+
+    /**
+     * HTTP request, sent exactly once
+     *
+     * @private
+     * @param {string} url HTTP URL
+     * @param {string} method HTTP method
+     * @param {object} [opts] Request options
+     * @returns {Promise<object>} HTTP response
+     */
+
+    async send(url, method, opts = {}) {
         opts.url = url;
         opts.method = method;
         opts.validateStatus = null;
@@ -119,7 +140,8 @@ class HttpClient {
         const resp = await this.request(url, 'head');
 
         if (!resp.headers['replay-nonce']) {
-            throw new Error('Failed to get nonce from ACME provider');
+            // With the response, so a rate limited nonce endpoint can be recognised and waited out
+            throw new HttpError(`Failed to get nonce from ACME provider (HTTP ${resp.status})`, resp);
         }
 
         return resp.headers['replay-nonce'];
@@ -293,42 +315,223 @@ class HttpClient {
      * @param {string} [opts.kid] JWS KID
      * @param {string} [opts.nonce] JWS anti-replay nonce
      * @param {boolean} [opts.includeExternalAccountBinding] Include EAB in request
-     * @param {number} [attempts] Request attempt counter
+     * @param {number} [opts.retryAttempt] Internal: rate limit / server error retry counter
+     * @param {number} [attempts] Internal: bad nonce retry counter
      * @returns {Promise<object>} HTTP response
      */
 
-    async signedRequest(url, payload, { kid = null, nonce = null, includeExternalAccountBinding = false } = {}, attempts = 0) {
+    async signedRequest(url, payload, {
+        kid = null, nonce = null, includeExternalAccountBinding = false, retryAttempt = 0,
+    } = {}, attempts = 0) {
         if (!nonce) {
             nonce = await this.getNonce();
         }
 
-        // External account binding
+        // External account binding, added to a copy so retries build it from the caller's payload again
+        let body = payload;
+
         if (includeExternalAccountBinding && this.externalAccountBinding) {
             if (this.externalAccountBinding.kid && this.externalAccountBinding.hmacKey) {
                 const jwk = this.getJwk();
                 const eabKid = this.externalAccountBinding.kid;
                 const eabHmacKey = this.externalAccountBinding.hmacKey;
 
-                payload.externalAccountBinding = this.createSignedHmacBody(eabHmacKey, url, jwk, { kid: eabKid });
+                body = { ...payload, externalAccountBinding: this.createSignedHmacBody(eabHmacKey, url, jwk, { kid: eabKid }) };
             }
         }
 
         // Sign body and send request
-        const data = this.createSignedBody(url, payload, { nonce, kid });
-        const resp = await this.request(url, 'post', { data });
+        const data = this.createSignedBody(url, body, { nonce, kid });
+        let resp;
+
+        try {
+            resp = await this.send(url, 'post', { data });
+        }
+        catch (e) {
+            // Transport failure (send() never rejects on a status): sign again with a fresh nonce, never replay
+            const outcome = { error: e };
+            const delay = getRetryDelay(outcome, retryAttempt);
+
+            if (delay === null) {
+                throw e;
+            }
+
+            return this.resignAndRetry(url, payload, { kid, includeExternalAccountBinding, retryAttempt }, attempts, {
+                cause: outcome, delay, last: { error: e }, replaySource: null,
+            });
+        }
 
         // Retry on bad nonce
         // https://datatracker.ietf.org/doc/html/rfc8555#section-6.5
         if (resp.data && resp.data.type && (resp.status === 400) && (resp.data.type === 'urn:ietf:params:acme:error:badNonce') && (attempts < this.maxBadNonceRetries)) {
-            nonce = resp.headers['replay-nonce'] || null;
+            const { nonce: retryNonce, error: nonceError, response: nonceResponse } = await this.getRetryNonce(resp, 0);
+
+            // No nonce to sign with: spend the rate limit / server error budget on getting one
+            if (!retryNonce) {
+                const nonceOutcome = nonceResponse ? { response: nonceResponse } : { error: nonceError };
+                const nonceDelay = getRetryDelay(nonceOutcome, retryAttempt);
+
+                if (nonceDelay === null) {
+                    return this.giveUpRetry({ response: resp }, nonceError);
+                }
+
+                return this.resignAndRetry(url, payload, { kid, includeExternalAccountBinding, retryAttempt }, attempts + 1, {
+                    cause: nonceOutcome, delay: nonceDelay, last: { response: resp }, replaySource: null,
+                });
+            }
+
             attempts += 1;
 
             log(`Caught invalid nonce error, retrying (${attempts}/${this.maxBadNonceRetries}) signed request to: ${url}`);
-            return this.signedRequest(url, payload, { kid, nonce, includeExternalAccountBinding }, attempts);
+            return this.signedRequest(url, payload, {
+                kid, nonce: retryNonce, includeExternalAccountBinding, retryAttempt,
+            }, attempts);
+        }
+
+        // Rate limits and server errors: sign again with a fresh nonce, never replay
+        const outcome = { response: resp };
+        const delay = getRetryDelay(outcome, retryAttempt);
+
+        if (delay !== null) {
+            return this.resignAndRetry(url, payload, { kid, includeExternalAccountBinding, retryAttempt }, attempts, {
+                cause: outcome, delay, last: { response: resp }, replaySource: resp,
+            });
         }
 
         // Return response
         return resp;
+    }
+
+    /**
+     * Wait, then sign the request again with a fresh nonce
+     *
+     * One budget covers everything: each wait spends one of `retryMaxAttempts`,
+     * whether it precedes the request itself or another try at getting a nonce.
+     * If no nonce can be had once the budget is spent, the caller gets back
+     * what it would have had without retrying: the last response, or the
+     * original transport error.
+     *
+     * @private
+     * @param {string} url Request URL
+     * @param {object} payload Request payload
+     * @param {object} opts Signing options and the retries done so far
+     * @param {number} attempts Bad nonce retries done so far
+     * @param {object} retry Why and how long to wait, and what to hand back
+     * @returns {Promise<object>} HTTP response
+     */
+
+    async resignAndRetry(url, payload, { kid, includeExternalAccountBinding, retryAttempt }, attempts, {
+        cause, delay, last, replaySource,
+    }) {
+        const nextAttempt = retryAttempt + 1;
+        await waitForRetry(cause, delay, nextAttempt, url);
+
+        const { nonce, error: nonceError, response: nonceResponse } = await this.getRetryNonce(replaySource, delay);
+
+        if (nonce) {
+            return this.signedRequest(url, payload, {
+                kid, nonce, includeExternalAccountBinding, retryAttempt: nextAttempt,
+            }, attempts);
+        }
+
+        // Wait as the nonce endpoint asks (its Retry-After), or our own backoff
+        const nonceOutcome = nonceResponse ? { response: nonceResponse } : { error: nonceError };
+        const nonceDelay = getRetryDelay(nonceOutcome, nextAttempt);
+
+        if (nonceDelay === null) {
+            return this.giveUpRetry(last, nonceError);
+        }
+
+        return this.resignAndRetry(url, payload, { kid, includeExternalAccountBinding, retryAttempt: nextAttempt }, attempts, {
+            cause: nonceOutcome, delay: nonceDelay, last, replaySource: null,
+        });
+    }
+
+    /**
+     * Hand back the last outcome of a retry that could not get a nonce
+     *
+     * The nonce failure is kept, non-enumerable so it stays out of logged
+     * responses: as `retryNonceError` on the response (apiRequest turns it into
+     * the cause of its HttpError), or as the cause of the transport error.
+     *
+     * @private
+     * @param {object} last Last response or transport error
+     * @param {Error} nonceError Why no nonce could be had
+     * @returns {object} The last response
+     */
+
+    giveUpRetry(last, nonceError) {
+        // Best effort: a frozen or non-object error is rethrown untouched
+        const hidden = (target, key, value) => {
+            if (!target || (typeof target !== 'object') || !Object.isExtensible(target)) {
+                return;
+            }
+
+            Object.defineProperty(target, key, {
+                value, enumerable: false, configurable: true, writable: true,
+            });
+        };
+
+        if (last.response) {
+            hidden(last.response, 'retryNonceError', nonceError);
+            return last.response;
+        }
+
+        hidden(last.error, 'retryNonceError', nonceError);
+
+        if (last.error && (typeof last.error === 'object') && (typeof last.error.cause === 'undefined')) {
+            hidden(last.error, 'cause', nonceError);
+        }
+
+        throw last.error;
+    }
+
+    /**
+     * Nonce for signing a retry
+     *
+     * The response that triggers a retry usually carries a fresh nonce in its
+     * Replay-Nonce header; using it saves a new-nonce request. It is only used
+     * when the retry follows within `replayNonceMaxAge` seconds, since a CA
+     * may expire a nonce while we wait. Otherwise one new nonce is fetched,
+     * with a single request: a failure is retried by the caller within the
+     * signed request's own budget, so nonce trouble cannot multiply retries.
+     *
+     * @private
+     * @param {object|null} resp Response that triggered the retry
+     * @param {number} waited Seconds waited since that response
+     * @returns {Promise<{nonce: (string|null), error: (Error|null), response: (object|null)}>} Nonce, or why there is none (and the failed nonce response, if any)
+     */
+
+    async getRetryNonce(resp, waited) {
+        const replayNonce = resp && resp.headers && resp.headers['replay-nonce'];
+
+        if (replayNonce && (waited <= this.replayNonceMaxAge)) {
+            return { nonce: replayNonce, error: null };
+        }
+
+        try {
+            // The cached directory, even if stale: refetching it would bring its own retries
+            const url = (this.directoryCache && this.directoryCache.newNonce) || await this.getResourceUrl('newNonce');
+            const nonceResp = await this.send(url, 'head');
+
+            if (!nonceResp.headers['replay-nonce']) {
+                // An HttpError, so whoever ends up with it can read the nonce endpoint's Retry-After
+                const error = new HttpError(`Failed to get nonce from ACME provider (HTTP ${nonceResp.status})`, nonceResp);
+                log(`Could not get a fresh nonce for the retry: ${error.message}`);
+
+                /* An error status decides the wait itself: its Retry-After for 429/5xx,
+                   giving up for other 4xx. A success without a nonce (a proxy dropping
+                   the header) is treated like a transport failure and retried on the
+                   own backoff. */
+                return { nonce: null, error, response: (nonceResp.status >= 400) ? nonceResp : null };
+            }
+
+            return { nonce: nonceResp.headers['replay-nonce'], error: null, response: null };
+        }
+        catch (e) {
+            log(`Could not get a fresh nonce for the retry: ${e.message}`);
+            return { nonce: null, error: e, response: null };
+        }
     }
 }
 
